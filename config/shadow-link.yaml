@@ -1,0 +1,59 @@
+# ONE shadow link carries the whole migration:
+#   topic data (offset-preserving) + schemas (same IDs) + consumer offsets + ACLs
+#
+# Created on the Redpanda (destination) cluster; it pulls from Confluent.
+# No MirrorMaker, no Connect cluster, no custom scripts.
+name: confluent-migration
+
+client_options:
+  bootstrap_servers:
+    - confluent-kafka:29092
+  tls_settings:
+    enabled: false
+
+# 1. TOPIC DATA -- byte-for-byte, same offsets, full history.
+topic_metadata_sync_options:
+  interval: 5s
+  auto_create_shadow_topic_filters:
+    - pattern_type: LITERAL
+      filter_type: INCLUDE
+      name: "*"
+  start_at_earliest: {}
+
+# 2. CONSUMER OFFSETS -- apps resume where they left off after cutover.
+consumer_offset_sync_options:
+  interval: 3s
+  group_filters:
+    - pattern_type: LITERAL
+      filter_type: INCLUDE
+      name: "*"
+
+# 3. ACLs -- security model comes across too.
+security_sync_options:
+  interval: 5s
+  acl_filters:
+    - resource_filter:
+        resource_type: ANY
+        pattern_type: ANY
+      access_filter:
+        operation: ANY
+        permission_type: ANY
+
+# 4. SCHEMAS -- API mode polls any Confluent-compatible Schema Registry REST API
+#    and preserves subjects, versions, schema IDs, references, compatibility.
+schema_registry_sync_options:
+  shadow_schema_registry_api:
+    source_url: http://confluent-schema-registry:8081
+    tls_settings:
+      enabled: false
+    # Demo-friendly intervals. Production defaults: tail 10s, full sync 5m.
+    tail_interval: 3s
+    full_sync_interval: 15s
+    max_source_requests_per_second: 30
+    source_filter:
+      contexts: ["."]
+      subjects: []
+    destination:
+      identity: {}
+    # Strip Confluent-only features (rule sets, metadata tags) instead of failing.
+    unsupported_schema_feature_policy: REMOVE

@@ -1,0 +1,184 @@
+# Confluent -> Redpanda migration with Shadowing (SE customer demo)
+# ================================================================
+# Based on the Redpanda lab "Migrate from Confluent with Shadowing":
+#   https://docs.redpanda.com/labs/docker-compose/confluent-schema-registry-shadowing/
+#
+# SOURCE      confluent-kafka + confluent-schema-registry (real Confluent Platform)
+# APPS        order-service (producer) + billing-service (consumer group)
+# DESTINATION redpanda-shadow (Kafka API + Schema Registry, Enterprise licensed)
+#
+# Ports
+#   8080  Redpanda Console -> Redpanda shadow cluster
+#   8088  Redpanda Console -> Confluent source (yes, Console works on any Kafka)
+#   8081  Confluent Schema Registry      28081 Redpanda Schema Registry
+#   9092  Confluent Kafka                29092 Redpanda Kafka   29644 Redpanda Admin
+#
+# Cutover is just a config change for each app:
+#   ORDERS_BOOTSTRAP / ORDERS_SR / ORDERS_CLUSTER (see scripts/demo.sh, act 4).
+
+x-app: &app
+  build: ./apps
+  image: shadow-demo-apps:latest
+  volumes:
+    - ./state:/state
+  networks: [demo]
+  restart: unless-stopped
+  environment: &app-env
+    BOOTSTRAP_SERVERS: ${ORDERS_BOOTSTRAP:-confluent-kafka:29092}
+    SR_URL: ${ORDERS_SR:-http://confluent-schema-registry:8081}
+    CLUSTER_LABEL: ${ORDERS_CLUSTER:-confluent}
+
+services:
+  # ---------------------------------------------------------------- SOURCE
+  confluent-kafka:
+    image: confluentinc/cp-kafka:${CONFLUENT_VERSION:-8.3.0}
+    hostname: confluent-kafka
+    container_name: confluent-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://confluent-kafka:29092,CONTROLLER://confluent-kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://confluent-kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@confluent-kafka:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+      # ACLs enabled so there is real security metadata to migrate. The lab is
+      # plaintext, so everyone connects as ANONYMOUS, which is a super user.
+      KAFKA_AUTHORIZER_CLASS_NAME: "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
+      KAFKA_SUPER_USERS: "User:ANONYMOUS"
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    ports: ["9092:9092"]
+    networks: [demo]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  confluent-schema-registry:
+    image: confluentinc/cp-schema-registry:${CONFLUENT_VERSION:-8.3.0}
+    hostname: confluent-schema-registry
+    container_name: confluent-schema-registry
+    depends_on:
+      confluent-kafka: {condition: service_healthy}
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: confluent-schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "confluent-kafka:29092"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+    ports: ["8081:8081"]
+    networks: [demo]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8081' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # ----------------------------------------------------------- DESTINATION
+  redpanda-shadow:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v26.2.1}
+    hostname: redpanda-shadow
+    container_name: redpanda-shadow
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr internal://redpanda-shadow:9092,external://localhost:29092
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:28081
+      - --rpc-addr redpanda-shadow:33145
+      - --advertise-rpc-addr redpanda-shadow:33145
+      - --mode dev-container
+      - --smp 1
+      - --set redpanda.enable_shadow_linking=true
+    ports: ["29092:29092", "28081:28081", "29644:9644"]
+    volumes:
+      - ./config:/config:ro
+      - ./license:/license:ro
+    networks: [demo]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # --------------------------------------------------------------- CONSOLES
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:${REDPANDA_CONSOLE_VERSION:-v3.10.0}
+    container_name: redpanda-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda-shadow:9092"]
+        schemaRegistry:
+          enabled: true
+          urls: ["http://redpanda-shadow:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda-shadow:9644"]
+    ports: ["8080:8080"]
+    networks: [demo]
+    depends_on:
+      redpanda-shadow: {condition: service_healthy}
+
+  source-console:
+    image: docker.redpanda.com/redpandadata/console:${REDPANDA_CONSOLE_VERSION:-v3.10.0}
+    container_name: source-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["confluent-kafka:29092"]
+        schemaRegistry:
+          enabled: true
+          urls: ["http://confluent-schema-registry:8081"]
+    ports: ["8088:8080"]
+    networks: [demo]
+    depends_on:
+      confluent-schema-registry: {condition: service_healthy}
+
+  # ------------------------------------------------------------------- APPS
+  # Tools container: seeding, scoreboard, test assertions.
+  tools:
+    <<: *app
+    container_name: tools
+    restart: "no"
+    command: ["sleep", "infinity"]
+    environment:
+      STATE_DIR: /state
+    depends_on:
+      confluent-schema-registry: {condition: service_healthy}
+
+  order-service:
+    <<: *app
+    container_name: order-service
+    command: ["python", "order_service.py"]
+    stop_grace_period: 20s
+    depends_on:
+      confluent-schema-registry: {condition: service_healthy}
+
+  billing-service:
+    <<: *app
+    container_name: billing-service
+    command: ["python", "billing_service.py"]
+    stop_grace_period: 20s
+    depends_on:
+      confluent-schema-registry: {condition: service_healthy}
+
+networks:
+  demo:
+    name: shadow-demo

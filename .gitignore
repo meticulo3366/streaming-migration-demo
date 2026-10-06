@@ -1,0 +1,4 @@
+license/*.license
+state/
+logs/
+__pycache__/
